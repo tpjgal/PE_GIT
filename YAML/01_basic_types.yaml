@@ -1,0 +1,53 @@
+# YAML Example: Basic Data Types
+# Demonstrates all fundamental YAML types
+
+# Strings
+title: "Learning YAML"
+description: A practical guide to YAML basics
+author: Your Name
+
+# Numbers
+age: 25
+height: 5.9
+year: 2024
+
+# Booleans
+is_active: true
+is_admin: false
+needs_update: yes
+deprecated: no
+
+# Null/Empty values
+empty_field: null
+another_empty: ~
+undefined_value:
+
+# Lists
+programming_languages:
+  - Python
+  - JavaScript
+  - Go
+  - Rust
+
+# Inline list (alternative syntax)
+frameworks: [Django, Flask, FastAPI]
+
+# Maps/Objects
+person:
+  first_name: John
+  last_name: Doe
+  email: john@example.com
+  phone: "555-1234"
+
+# Nested structure
+company:
+  name: TechCorp
+  location:
+    city: San Francisco
+    state: California
+    zip: "94105"
+  employees: 150
+  departments:
+    - engineering
+    - marketing
+    - sales

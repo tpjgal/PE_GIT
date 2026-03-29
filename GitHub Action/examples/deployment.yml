@@ -1,0 +1,103 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches: [ main, staging ]
+  release:
+    types: [published]
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: 18
+          cache: npm
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Run tests
+        run: npm test
+      
+      - name: Build application
+        run: npm run build
+      
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: build
+          path: dist/
+          retention-days: 1
+  
+  deploy-staging:
+    needs: build
+    if: github.ref == 'refs/heads/staging'
+    runs-on: ubuntu-latest
+    environment: staging
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Download build artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: build
+          path: dist/
+      
+      - name: Deploy to staging
+        run: |
+          echo "Deploying to staging environment..."
+          echo "Build artifacts: $(ls -la dist/)"
+          # Add your staging deployment commands here
+      
+      - name: Run smoke tests
+        run: echo "Running smoke tests on staging..."
+  
+  deploy-production:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: 
+      name: production
+      url: https://myapp.example.com
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Download build artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: build
+          path: dist/
+      
+      - name: Deploy to production
+        run: |
+          echo "Deploying to production environment..."
+          echo "Build artifacts: $(ls -la dist/)"
+          # Add your production deployment commands here
+      
+      - name: Health check
+        run: |
+          echo "Running health checks..."
+          sleep 10
+          # Add health check command
+      
+      - name: Notify deployment
+        if: success()
+        run: |
+          echo "✅ Successfully deployed to production"
+          echo "Build: ${{ github.sha }}"

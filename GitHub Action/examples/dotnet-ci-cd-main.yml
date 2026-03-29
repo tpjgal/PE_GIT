@@ -1,0 +1,327 @@
+name: C# CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop, 'release/**' ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+env:
+  DOTNET_VERSION: '8.0.x'
+  SOLUTION_FILE: 'YourSolution.sln'
+  PROJECT_FILE: 'src/YourProject.csproj'
+  TEST_PROJECT_FILE: 'tests/YourProject.Tests.csproj'
+  CONFIGURATION: 'Release'
+  ARTIFACTS_DIR: '${{ github.workspace }}/artifacts'
+
+jobs:
+  # Stage 1: Code Analysis & Quality Checks
+  analyze:
+    name: Code Analysis
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+      
+      - name: Restore dependencies
+        run: dotnet restore ${{ env.SOLUTION_FILE }}
+      
+      - name: Run SonarQube analysis
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          dotnet tool install --global dotnet-sonarscanner
+          dotnet sonarscanner begin /k:"${{ github.repository }}" /d:sonar.host.url="https://sonarcloud.io" /d:sonar.login="${{ secrets.SONAR_TOKEN }}" /d:sonar.cs.opencover.reportsPaths="coverage.opencover.xml" || true
+          dotnet build ${{ env.SOLUTION_FILE }} --configuration ${{ env.CONFIGURATION }} --no-restore
+          dotnet sonarscanner end /d:sonar.login="${{ secrets.SONAR_TOKEN }}" || true
+      
+      # Alternative: StyleCop Analysis (if SonarQube not configured)
+      - name: Run StyleCop Analysis
+        run: |
+          dotnet build ${{ env.SOLUTION_FILE }} \
+            /p:EnforceCodeStyleInBuild=true \
+            /p:TreatWarningsAsErrors=false \
+            --configuration ${{ env.CONFIGURATION }} \
+            --no-restore
+        continue-on-error: true
+      
+      - name: Archive analysis results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-analysis-results
+          path: |
+            bin/
+            obj/
+          retention-days: 7
+
+  # Stage 2: Build .NET Project
+  build:
+    name: Build Project
+    runs-on: windows-latest
+    needs: analyze
+    strategy:
+      matrix:
+        configuration: [ 'Debug', 'Release' ]
+      fail-fast: false
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+      
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/packages.lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+      
+      - name: Restore dependencies
+        run: dotnet restore ${{ env.SOLUTION_FILE }}
+      
+      - name: Build solution
+        run: dotnet build ${{ env.SOLUTION_FILE }} `
+          --configuration ${{ matrix.configuration }} `
+          --no-restore `
+          --verbosity normal
+      
+      - name: Generate build info
+        run: |
+          $buildInfo = @{
+            Configuration = "${{ matrix.configuration }}"
+            BuildTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            CommitSha = "${{ github.sha }}"
+            GitRef = "${{ github.ref }}"
+            RunNumber = "${{ github.run_number }}"
+          }
+          $buildInfo | ConvertTo-Json | Out-File -FilePath build-info.json
+      
+      - name: Archive build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.configuration }}
+          path: |
+            bin/
+            build-info.json
+          retention-days: 14
+
+  # Stage 3: Run Unit Tests
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: build
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+      
+      - name: Restore dependencies
+        run: dotnet restore ${{ env.SOLUTION_FILE }}
+      
+      - name: Run unit tests with coverage
+        run: dotnet test ${{ env.TEST_PROJECT_FILE }} `
+          --configuration ${{ env.CONFIGURATION }} `
+          --no-restore `
+          --logger "trx;LogFileName=test-results.trx" `
+          --collect:"XPlat Code Coverage" `
+          --settings runsettings.xml `
+          -- RunConfiguration.DisableAppDomain=true
+      
+      - name: Publish test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: |
+            **/test-results.trx
+            **/coverage.cobertura.xml
+          retention-days: 30
+      
+      - name: Post test metrics
+        if: always()
+        run: |
+          $testResults = Get-ChildItem -Recurse -Filter "test-results.trx"
+          Write-Host "Test Results:"
+          foreach ($file in $testResults) {
+            [xml]$xml = Get-Content $file.FullName
+            $passed = ($xml.TestRun.Results.UnitTestResult | Where-Object { $_.outcome -eq "Passed" }).Count
+            $failed = ($xml.TestRun.Results.UnitTestResult | Where-Object { $_.outcome -eq "Failed" }).Count
+            Write-Host "  Passed: $passed"
+            Write-Host "  Failed: $failed"
+            Write-Host "  Total: $($passed + $failed)"
+          }
+
+  # Stage 4: Code Coverage Analysis
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    needs: test
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+      
+      - name: Download test artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: test-results
+      
+      - name: Generate coverage report
+        run: |
+          dotnet tool install --global dotnet-reportgenerator-globaltool
+          reportgenerator -reports:"**/coverage.cobertura.xml" `
+            -targetdir:"coverage-report" `
+            -reporttypes:"HtmlInline;HtmlChart;Cobertura"
+      
+      - name: Archive coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report-html
+          path: coverage-report/
+          retention-days: 30
+      
+      - name: Comment PR with coverage
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const coverage = fs.readFileSync('coverage-report/summary.txt', 'utf8');
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## Code Coverage\n\`\`\`\n${coverage}\n\`\`\``
+            });
+        continue-on-error: true
+
+  # Stage 5: Package & Create Artifacts
+  package:
+    name: Package Artifacts
+    runs-on: windows-latest
+    needs: [ build, test, coverage ]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+      
+      - name: Restore dependencies
+        run: dotnet restore ${{ env.SOLUTION_FILE }}
+      
+      - name: Publish Release build
+        run: dotnet publish ${{ env.PROJECT_FILE }} `
+          --configuration ${{ env.CONFIGURATION }} `
+          --output "${{ env.ARTIFACTS_DIR }}/publish" `
+          --no-restore `
+          --no-build `
+          --self-contained false `
+          -p:PublishReadyToRun=true `
+          -p:PublishTrimmed=false
+      
+      - name: Create NuGet package
+        run: dotnet pack ${{ env.PROJECT_FILE }} `
+          --configuration ${{ env.CONFIGURATION }} `
+          --include-symbols `
+          --output "${{ env.ARTIFACTS_DIR }}/nuget" `
+          --no-restore `
+          -p:SymbolPackageFormat=snupkg
+      
+      - name: Create ZIP archive
+        shell: pwsh
+        run: |
+          $publishPath = "${{ env.ARTIFACTS_DIR }}/publish"
+          $zipPath = "${{ env.ARTIFACTS_DIR }}/YourProject-${{ github.run_number }}-release.zip"
+          
+          if (Test-Path $publishPath) {
+            Compress-Archive -Path $publishPath/* -DestinationPath $zipPath -Force
+            Write-Host "Created ZIP: $zipPath"
+          }
+      
+      - name: Generate checksums
+        shell: pwsh
+        run: |
+          $artifactsPath = "${{ env.ARTIFACTS_DIR }}"
+          Get-ChildItem -Path $artifactsPath -Recurse -File | ForEach-Object {
+            $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
+            "$($hash) $($_.Name)" | Out-File -FilePath "$artifactsPath/CHECKSUMS.txt" -Append
+          }
+      
+      - name: Archive all packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-release
+          path: ${{ env.ARTIFACTS_DIR }}/
+          retention-days: 60
+
+  # Stage 6: Summary & Reporting
+  summary:
+    name: Build Summary
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [ analyze, build, test, coverage, package ]
+    
+    steps:
+      - name: Generate summary
+        run: |
+          echo "## Build Summary for ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch**: ${{ github.ref }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Actor**: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Run**: [${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Job Status" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Code Analysis: ${{ needs.analyze.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Build: ${{ needs.build.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Tests: ${{ needs.test.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Coverage: ${{ needs.coverage.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Packaging: ${{ needs.package.result }}" >> $GITHUB_STEP_SUMMARY
+      
+      - name: Notify on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number || context.payload.pull_request?.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `⚠️ Build #${{ github.run_number }} failed. Check [workflow logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})`,
+            });
+        continue-on-error: true
+      
+      - name: Set workflow status
+        run: |
+          if "${{ job.status }}" == "failure"; then
+            exit 1
+          fi

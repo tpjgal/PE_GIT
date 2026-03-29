@@ -1,0 +1,56 @@
+name: Scheduled Nightly Tasks
+
+on:
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  
+  # Allow manual trigger
+  workflow_dispatch:
+
+jobs:
+  nightly-tests:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup environment
+        uses: actions/setup-node@v3
+        with:
+          node-version: 18
+          cache: npm
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Run comprehensive tests
+        run: npm run test:full
+      
+      - name: Generate coverage report
+        run: npm run test:coverage
+      
+      - name: Upload coverage
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 30
+  
+  scheduled-cleanup:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Log cleanup time
+        run: |
+          echo "Running scheduled cleanup at $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+      
+      - name: Cleanup old artifacts
+        uses: geekyeggo/delete-artifact@v2
+        with:
+          min-age: 30d  # Delete artifacts older than 30 days
+      
+      - name: Report completion
+        run: echo "Cleanup completed successfully"

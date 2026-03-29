@@ -1,0 +1,310 @@
+name: Code Signing & Release
+
+# Trigger on release creation or manual dispatch
+on:
+  release:
+    types: [published, created]
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: 'Release type (alpha, beta, release)'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - alpha
+          - beta
+          - release
+
+env:
+  SOLUTION_FILE: 'MyProject.sln'
+  BUILD_OUTPUT_DIR: '${{ github.workspace }}\build\output'
+  ARTIFACTS_DIR: '${{ github.workspace }}\artifacts'
+  MSBUILD_PATH: 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\MSBuild.exe'
+  SIGNTOOL_PATH: 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\signtool.exe'
+
+permissions:
+  repository-projects: read
+  packages: write
+  contents: write
+
+jobs:
+  # Build release version
+  build-release:
+    name: Build Release
+    runs-on: windows-latest
+    
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      artifact_path: ${{ steps.build.outputs.artifact_path }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      
+      - name: Determine version
+        id: version
+        run: |
+          if ("${{ github.event.release.tag_name }}" -ne "") {
+            $version = "${{ github.event.release.tag_name }}" -replace '^v', ''
+          } else {
+            $version = "1.0.0.${{ github.run_number }}"
+          }
+          echo "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Host "Release Version: $version"
+      
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v1
+        with:
+          vs-version: '17'
+          msbuild-architecture: x64
+      
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v1
+      
+      - name: Restore NuGet packages
+        run: nuget restore "${{ env.SOLUTION_FILE }}"
+      
+      - name: Create build directories
+        run: |
+          New-Item -ItemType Directory -Path "${{ env.BUILD_OUTPUT_DIR }}" -Force
+          New-Item -ItemType Directory -Path "${{ env.ARTIFACTS_DIR }}" -Force
+      
+      - name: Build Release
+        id: build
+        run: |
+          & "${{ env.MSBUILD_PATH }}" "${{ env.SOLUTION_FILE }}" `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:OutputPath="${{ env.BUILD_OUTPUT_DIR }}\release\" `
+            /p:Version="${{ steps.version.outputs.version }}" `
+            /p:InformationalVersion="${{ steps.version.outputs.version }}" `
+            /m /verbosity:normal
+          
+          if ($LASTEXITCODE -ne 0) {
+            throw "Build failed"
+          }
+          
+          echo "artifact_path=${{ env.BUILD_OUTPUT_DIR }}\release" >> $env:GITHUB_OUTPUT
+      
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: release-build
+          path: ${{ steps.build.outputs.artifact_path }}
+          retention-days: 5
+
+  # Code signing
+  sign-code:
+    name: Sign Code & Binaries
+    runs-on: windows-latest
+    needs: build-release
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Download build artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: release-build
+          path: ${{ env.BUILD_OUTPUT_DIR }}/release
+      
+      - name: Configure signing certificate
+        run: |
+          # Import certificate from secrets
+          $certBytes = [System.Convert]::FromBase64String("${{ secrets.SIGNING_CERTIFICATE_BASE64 }}")
+          $certPath = "${{ env.ARTIFACTS_DIR }}\codesigning.pfx"
+          [IO.File]::WriteAllBytes($certPath, $certBytes)
+          
+          Write-Host "Certificate configured at: $certPath"
+      
+      - name: Sign executables
+        run: |
+          $certPath = "${{ env.ARTIFACTS_DIR }}\codesigning.pfx"
+          $exeFiles = Get-ChildItem -Path "${{ env.BUILD_OUTPUT_DIR }}" -Filter "*.exe" -Recurse
+          $dllFiles = Get-ChildItem -Path "${{ env.BUILD_OUTPUT_DIR }}" -Filter "*.dll" -Recurse
+          
+          $filesToSign = @($exeFiles) + @($dllFiles)
+          
+          foreach ($file in $filesToSign) {
+            Write-Host "Signing: $($file.FullName)"
+            
+            & "${{ env.SIGNTOOL_PATH }}" sign `
+              /f $certPath `
+              /p "${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}" `
+              /t "http://timestamp.digicert.com" `
+              /fd SHA256 `
+              /v `
+              "$($file.FullName)"
+            
+            if ($LASTEXITCODE -ne 0) {
+              throw "Failed to sign: $($file.FullName)"
+            }
+          }
+      
+      - name: Verify signatures
+        run: |
+          $exeFiles = Get-ChildItem -Path "${{ env.BUILD_OUTPUT_DIR }}" -Filter "*.exe" -Recurse
+          
+          foreach ($file in $exeFiles) {
+            Write-Host "Verifying: $($file.FullName)"
+            
+            & "${{ env.SIGNTOOL_PATH }}" verify `
+              /pa `
+              /v `
+              "$($file.FullName)"
+            
+            if ($LASTEXITCODE -ne 0) {
+              throw "Signature verification failed for: $($file.FullName)"
+            }
+          }
+      
+      - name: Upload signed binaries
+        uses: actions/upload-artifact@v3
+        with:
+          name: signed-release
+          path: ${{ env.BUILD_OUTPUT_DIR }}/release
+          retention-days: 30
+      
+      - name: Clean up certificate
+        if: always()
+        run: |
+          Remove-Item -Path "${{ env.ARTIFACTS_DIR }}\codesigning.pfx" -Force -ErrorAction SilentlyContinue
+
+  # Create release packages
+  create-release-packages:
+    name: Create Release Packages
+    runs-on: windows-latest
+    needs: [build-release, sign-code]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Download signed binaries
+        uses: actions/download-artifact@v3
+        with:
+          name: signed-release
+          path: ${{ env.BUILD_OUTPUT_DIR }}/release
+      
+      - name: Create package directory structure
+        run: |
+          $packageRoot = "${{ env.ARTIFACTS_DIR }}\MyProject-v${{ needs.build-release.outputs.version }}"
+          
+          New-Item -ItemType Directory -Path "$packageRoot\bin" -Force
+          New-Item -ItemType Directory -Path "$packageRoot\lib" -Force
+          New-Item -ItemType Directory -Path "$packageRoot\include" -Force
+          New-Item -ItemType Directory -Path "$packageRoot\docs" -Force
+          
+          # Copy binaries
+          Copy-Item "${{ env.BUILD_OUTPUT_DIR }}\release\*.exe" -Destination "$packageRoot\bin" -Force -ErrorAction SilentlyContinue
+          Copy-Item "${{ env.BUILD_OUTPUT_DIR }}\release\*.dll" -Destination "$packageRoot\bin" -Force -ErrorAction SilentlyContinue
+          Copy-Item "${{ env.BUILD_OUTPUT_DIR }}\release\*.lib" -Destination "$packageRoot\lib" -Force -ErrorAction SilentlyContinue
+          
+          # Copy headers
+          Copy-Item "src\*.h" -Destination "$packageRoot\include" -Recurse -Force -ErrorAction SilentlyContinue
+          
+          # Copy documentation
+          Copy-Item "README.md" -Destination $packageRoot -Force -ErrorAction SilentlyContinue
+          Copy-Item "LICENSE" -Destination $packageRoot -Force -ErrorAction SilentlyContinue
+          Copy-Item "docs\*" -Destination "$packageRoot\docs" -Recurse -Force -ErrorAction SilentlyContinue
+          
+          # Create checksum file
+          $checksumFile = "$packageRoot\CHECKSUMS.txt"
+          "SHA256 Checksums" | Out-File -FilePath $checksumFile -Encoding UTF8
+          "Generated on $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')" | Out-File -FilePath $checksumFile -Append -Encoding UTF8
+          "" | Out-File -FilePath $checksumFile -Append -Encoding UTF8
+          
+          Get-ChildItem -Path $packageRoot -File -Recurse | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash
+            "$hash  $($_.Name)" | Out-File -FilePath $checksumFile -Append -Encoding UTF8
+          }
+      
+      - name: Create ZIP archive
+        run: |
+          $packageRoot = "${{ env.ARTIFACTS_DIR }}\MyProject-v${{ needs.build-release.outputs.version }}"
+          $zipFile = "${{ env.ARTIFACTS_DIR }}\MyProject-v${{ needs.build-release.outputs.version }}-win64.zip"
+          
+          Compress-Archive -Path $packageRoot -DestinationPath $zipFile -Force
+          Write-Host "ZIP package created: $zipFile"
+          
+          $fileSize = (Get-Item $zipFile).Length / 1MB
+          Write-Host "Package size: $([Math]::Round($fileSize, 2)) MB"
+      
+      - name: Create release notes
+        run: |
+          $releaseNotes = @"
+          # Release v${{ needs.build-release.outputs.version }}
+          
+          ## Build Information
+          - Build Date: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')
+          - Commit: ${{ github.sha }}
+          - Build Number: ${{ github.run_number }}
+          - Runner: windows-latest
+          
+          ## What's Included
+          - MyProject.exe (code signed)
+          - MyProject.dll (code signed)
+          - Libraries and headers
+          - Documentation
+          - License and README
+          
+          ## Installation
+          1. Download the ZIP file
+          2. Extract to your desired location
+          3. Run MyProject.exe from the bin directory
+          
+          ## System Requirements
+          - Windows 10 or later (x64)
+          - Visual C++ Runtime 2022
+          
+          ## Security
+          All binaries are digitally signed with our code signing certificate.
+          To verify: `signtool verify /pa /v MyProject.exe`
+          "@
+          
+          $releaseNotes | Out-File -Path "${{ env.ARTIFACTS_DIR }}\RELEASE_NOTES.md" -Encoding UTF8
+      
+      - name: Upload packages to release
+        uses: softprops/action-gh-release@v1
+        if: github.event.release
+        with:
+          files: |
+            ${{ env.ARTIFACTS_DIR }}/MyProject-v*.zip
+            ${{ env.ARTIFACTS_DIR }}/RELEASE_NOTES.md
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Publish to artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: release-packages
+          path: |
+            ${{ env.ARTIFACTS_DIR }}/MyProject-v*.zip
+            ${{ env.ARTIFACTS_DIR }}/RELEASE_NOTES.md
+          retention-days: 90
+
+  # Post-release tasks
+  post-release:
+    name: Post-Release Tasks
+    runs-on: windows-latest
+    needs: [build-release, create-release-packages]
+    if: always() && github.event.release
+    
+    steps:
+      - name: Create GitHub release summary
+        run: |
+          Write-Host "═══════════════════════════════════════════════"
+          Write-Host "Release v${{ needs.build-release.outputs.version }} Created"
+          Write-Host "═══════════════════════════════════════════════"
+          Write-Host ""
+          Write-Host "✓ Build completed"
+          Write-Host "✓ Binaries code signed"
+          Write-Host "✓ Packages created"
+          Write-Host "✓ Release published to GitHub Releases"
+          Write-Host ""
+          Write-Host "Release URL:"
+          Write-Host "  https://github.com/${{ github.repository }}/releases/tag/${{ github.event.release.tag_name }}"
+          Write-Host ""

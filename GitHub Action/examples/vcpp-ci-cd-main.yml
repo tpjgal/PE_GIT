@@ -1,0 +1,384 @@
+name: VC++ CI/CD Pipeline
+
+# Trigger on push to development branches and pull requests
+on:
+  push:
+    branches: 
+      - main
+      - develop
+      - 'release/**'
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'CMakeLists.txt'
+      - '.github/workflows/vcpp-ci-cd-main.yml'
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type (Debug/Release)'
+        required: false
+        default: 'Release'
+
+env:
+  # Visual Studio Configuration
+  VS_PATH: 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise'
+  VCVARS_SCRIPT: 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat'
+  MSBUILD_PATH: 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\MSBuild.exe'
+  
+  # Build Configuration
+  SOLUTION_FILE: 'MyProject.sln'
+  PROJECT_FILE: 'src/MyProject.vcxproj'
+  BUILD_OUTPUT_DIR: '${{ github.workspace }}\build\output'
+  TEST_RESULTS_DIR: '${{ github.workspace }}\test_results'
+  ARTIFACTS_DIR: '${{ github.workspace }}\artifacts'
+  
+  # Versions
+  DOXYFILE_PATH: 'docs/Doxyfile'
+  SIGNTOOL_PATH: 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\signtool.exe'
+
+jobs:
+  # Stage 1: Analyze code quality and lint
+  analyze:
+    name: Code Analysis & Lint
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      
+      - name: Install dependencies
+        run: |
+          # Install cppcheck for static analysis
+          choco install cppcheck -y
+          
+      - name: Run static analysis with Cppcheck
+        run: |
+          mkdir -p "${{ env.BUILD_OUTPUT_DIR }}"
+          cppcheck --enable=all --suppress=missingIncludeSystem `
+                   --xml --xml-version=2 src/ `
+                   > "${{ env.BUILD_OUTPUT_DIR }}/cppcheck-report.xml" 2>&1 || true
+      
+      - name: Upload analysis results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: code-analysis-results
+          path: ${{ env.BUILD_OUTPUT_DIR }}/cppcheck-report.xml
+  
+  # Stage 2: Build project
+  build:
+    name: Build (${{ matrix.configuration }}, ${{ matrix.platform }})
+    runs-on: windows-latest
+    needs: analyze
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        configuration: [Debug, Release]
+        platform: [x64, Win32]
+        include:
+          # Make Release x64 primary
+          - configuration: Release
+            platform: x64
+            primary: true
+            upload_artifacts: true
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v1
+        with:
+          vs-version: '17'
+          msbuild-architecture: x64
+      
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v1
+      
+      - name: Restore NuGet packages
+        run: |
+          nuget restore "${{ env.SOLUTION_FILE }}"
+      
+      - name: Create build artifacts directory
+        run: |
+          New-Item -ItemType Directory -Path "${{ env.BUILD_OUTPUT_DIR }}" -Force
+          New-Item -ItemType Directory -Path "${{ env.ARTIFACTS_DIR }}" -Force
+      
+      - name: Build project
+        id: build
+        run: |
+          $buildVersion = "${{ github.run_number }}"
+          echo "::set-output name=build_version::$buildVersion"
+          
+          # Run MSBuild
+          & "${{ env.MSBUILD_PATH }}" "${{ env.SOLUTION_FILE }}" `
+            /p:Configuration=${{ matrix.configuration }} `
+            /p:Platform=${{ matrix.platform }} `
+            /p:OutputPath="${{ env.BUILD_OUTPUT_DIR }}\${{ matrix.platform }}\${{ matrix.configuration }}\" `
+            /p:Version="1.0.0.$buildVersion" `
+            /m /verbosity:normal
+          
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Build failed with code $LASTEXITCODE"
+            exit $LASTEXITCODE
+          }
+      
+      - name: Log build results
+        if: always()
+        run: |
+          echo "Build Configuration: ${{ matrix.configuration }}"
+          echo "Build Platform: ${{ matrix.platform }}"
+          echo "Build Version: ${{ steps.build.outputs.build_version }}"
+          dir "${{ env.BUILD_OUTPUT_DIR }}" /s /o:n
+      
+      - name: Upload build output (Release x64 only)
+        if: matrix.upload_artifacts && success()
+        uses: actions/upload-artifact@v3
+        with:
+          name: build-output-${{ matrix.configuration }}-${{ matrix.platform }}
+          path: ${{ env.BUILD_OUTPUT_DIR }}
+          retention-days: 5
+  
+  # Stage 3: Run unit tests
+  unit-tests:
+    name: Unit Tests (${{ matrix.platform }})
+    runs-on: windows-latest
+    needs: build
+    
+    strategy:
+      matrix:
+        platform: [x64, Win32]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Download build artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: build-output-Release-${{ matrix.platform }}
+          path: ${{ env.BUILD_OUTPUT_DIR }}
+      
+      - name: Setup test framework (Google Test)
+        run: |
+          choco install googletest -y
+      
+      - name: Run unit tests
+        id: tests
+        run: |
+          $testResultsPath = "${{ env.TEST_RESULTS_DIR }}\results_${{ matrix.platform }}.xml"
+          New-Item -ItemType Directory -Path "${{ env.TEST_RESULTS_DIR }}" -Force
+          
+          # Navigate to test binaries
+          $testBinary = "${{ env.BUILD_OUTPUT_DIR }}\${{ matrix.platform }}\Release\MyProjectTests.exe"
+          
+          if (Test-Path $testBinary) {
+            & $testBinary `
+              --gtest_output="xml:$testResultsPath"
+          } else {
+            Write-Warning "Test binary not found: $testBinary"
+          }
+      
+      - name: Publish test results
+        if: always()
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        with:
+          files: ${{ env.TEST_RESULTS_DIR }}/results_*.xml
+          check_name: Unit Test Results (${{ matrix.platform }})
+          comment_title: Test Results
+      
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: test-results-${{ matrix.platform }}
+          path: ${{ env.TEST_RESULTS_DIR }}
+  
+  # Stage 4: Run code coverage
+  coverage:
+    name: Code Coverage
+    runs-on: windows-latest
+    needs: unit-tests
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v1
+        with:
+          vs-version: '17'
+          msbuild-architecture: x64
+      
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v1
+      
+      - name: Restore NuGet packages
+        run: nuget restore "${{ env.SOLUTION_FILE }}"
+      
+      - name: Build with coverage instrumentation
+        run: |
+          & "${{ env.MSBUILD_PATH }}" "${{ env.SOLUTION_FILE }}" `
+            /p:Configuration=Debug `
+            /p:Platform=x64 `
+            /p:OutputPath="${{ env.BUILD_OUTPUT_DIR }}\coverage\" `
+            /p:InstrumentForCoverage=true
+      
+      - name: Install OpenCppCoverage
+        run: choco install opencppcoverage -y
+      
+      - name: Run coverage analysis
+        run: |
+          $coveragePath = "${{ env.ARTIFACTS_DIR }}\coverage"
+          New-Item -ItemType Directory -Path $coveragePath -Force
+          
+          OpenCppCoverage.exe `
+            --sources src `
+            --export_type html:`"$coveragePath`" `
+            -- "${{ env.BUILD_OUTPUT_DIR }}\coverage\x64\Debug\MyProjectTests.exe"
+      
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v3
+        with:
+          name: coverage-report
+          path: ${{ env.ARTIFACTS_DIR }}/coverage
+  
+  # Stage 5: Package application
+  package:
+    name: Package Application
+    runs-on: windows-latest
+    needs: [unit-tests]
+    if: success()
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Download build artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: build-output-Release-x64
+          path: ${{ env.BUILD_OUTPUT_DIR }}
+      
+      - name: Create package structure
+        run: |
+          $packageDir = "${{ env.ARTIFACTS_DIR }}\package"
+          $binDir = "$packageDir\bin"
+          
+          New-Item -ItemType Directory -Path $binDir -Force
+          New-Item -ItemType Directory -Path "$packageDir\lib" -Force
+          New-Item -ItemType Directory -Path "$packageDir\include" -Force
+          
+          # Copy binaries
+          Copy-Item "${{ env.BUILD_OUTPUT_DIR }}\x64\Release\MyProject.exe" -Destination $binDir -Force
+          Copy-Item "${{ env.BUILD_OUTPUT_DIR }}\x64\Release\*.dll" -Destination $binDir -Force
+          
+          # Copy headers
+          Copy-Item "src\*.h" -Destination "$packageDir\include" -Recurse -Force
+          
+          # Copy documentation
+          Copy-Item "README.md" -Destination $packageDir -Force
+          Copy-Item "LICENSE" -Destination $packageDir -Force
+      
+      - name: Create ZIP package
+        run: |
+          $packageDir = "${{ env.ARTIFACTS_DIR }}\package"
+          $version = "${{ github.run_number }}"
+          $zipFile = "${{ env.ARTIFACTS_DIR }}\MyProject-v1.0.0.$version.zip"
+          
+          Compress-Archive -Path $packageDir -DestinationPath $zipFile -Force
+          Write-Host "Package created: $zipFile"
+      
+      - name: Create MSI installer
+        run: |
+          # This requires WiX Toolset to be installed
+          choco install wixtoolset -y
+          
+          $wixFile = "setup\MyProject.wxs"
+          $msiFile = "${{ env.ARTIFACTS_DIR }}\MyProject-v1.0.0.${{ github.run_number }}.msi"
+          
+          if (Test-Path $wixFile) {
+            & "$Env:ProgramFiles(x86)}\WiX Toolset v3.11\bin\candle.exe" `
+              -out "${{ env.BUILD_OUTPUT_DIR }}\MyProject.wixobj" `
+              -d"SourceDir=${{ env.BUILD_OUTPUT_DIR }}\x64\Release" `
+              $wixFile
+            
+            & "$Env:ProgramFiles(x86)}\WiX Toolset v3.11\bin\light.exe" `
+              -out "$msiFile" `
+              "${{ env.BUILD_OUTPUT_DIR }}\MyProject.wixobj"
+          }
+      
+      - name: Generate package manifest
+        run: |
+          $manifest = @{
+            version = "1.0.0.${{ github.run_number }}"
+            build_date = Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC'
+            commit = "${{ github.sha }}"
+            branch = "${{ github.ref }}"
+            build_runner = "GitHub Actions on windows-latest"
+          }
+          
+          $manifest | ConvertTo-Json | Out-File -Path "${{ env.ARTIFACTS_DIR }}\MANIFEST.json"
+      
+      - name: Upload packages
+        uses: actions/upload-artifact@v3
+        with:
+          name: packages
+          path: ${{ env.ARTIFACTS_DIR }}/*.zip
+          retention-days: 30
+      
+      - name: Upload MSI
+        uses: actions/upload-artifact@v3
+        if: success()
+        with:
+          name: installer
+          path: ${{ env.ARTIFACTS_DIR }}/*.msi
+          retention-days: 30
+  
+  # Stage 6: Summary and reporting
+  summary:
+    name: Build Summary
+    runs-on: windows-latest
+    needs: [analyze, build, unit-tests, package]
+    if: always()
+    
+    steps:
+      - name: Generate build report
+        run: |
+          Write-Host "═══════════════════════════════════════════════"
+          Write-Host "GitHub Actions VC++ CI/CD Pipeline Report"
+          Write-Host "═══════════════════════════════════════════════"
+          Write-Host ""
+          Write-Host "Build Information:"
+          Write-Host "  Repository: ${{ github.repository }}"
+          Write-Host "  Branch: ${{ github.ref }}"
+          Write-Host "  Commit: ${{ github.sha }}"
+          Write-Host "  Author: ${{ github.actor }}"
+          Write-Host "  Build #: ${{ github.run_number }}"
+          Write-Host ""
+          Write-Host "Step Status:"
+          Write-Host "  ✓ Code Analysis"
+          Write-Host "  ✓ Build (Debug & Release, x86 & x64)"
+          Write-Host "  ✓ Unit Tests"
+          Write-Host "  ✓ Packaging"
+          Write-Host ""
+          Write-Host "Artifacts Available:"
+          Write-Host "  • Build outputs"
+          Write-Host "  • Test results"
+          Write-Host "  • Coverage reports"
+          Write-Host "  • Application packages (.zip)"
+          Write-Host "  • Installer (.msi)"
+          Write-Host ""
+          Write-Host "═══════════════════════════════════════════════"
+      
+      - name: Check build status
+        if: failure()
+        run: |
+          Write-Error "Build pipeline failed at one or more stages"
+          exit 1

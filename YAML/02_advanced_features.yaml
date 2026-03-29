@@ -1,0 +1,81 @@
+# YAML Example: Advanced Features
+# Demonstrates anchors, aliases, and multi-line strings
+
+# Anchor and Alias Example (DRY Principle)
+# Define default database settings once
+default_db: &default_database
+  driver: postgresql
+  port: 5432
+  pool_size: 10
+  timeout: 30
+
+# Use the alias for different environments
+development:
+  database:
+    <<: *default_database  # Merge the default settings
+    host: localhost
+    username: dev_user
+    debug: true
+
+staging:
+  database:
+    <<: *default_database
+    host: staging-db.internal
+    username: staging_user
+    debug: false
+
+production:
+  database:
+    <<: *default_database
+    host: prod-db.internal
+    username: prod_user
+    debug: false
+    pool_size: 50  # Override default pool size
+
+# Multi-line Strings
+
+# Literal style (|) - preserves newlines
+instructions: |
+  Step 1: Install YAML library
+  Step 2: Parse your file
+  Step 3: Access the data
+  Step 4: Celebrate!
+
+# Folded style (>) - folds newlines into spaces
+bio: >
+  This is a biography that spans
+  multiple lines but will be folded
+  into a single paragraph with
+  spaces between the lines.
+
+# Quoted strings with special characters
+special_chars: "Key: value with colon"
+path_example: "C:\\Users\\name\\Documents"
+regex_pattern: "^[a-z]+@.+\\.com$"
+
+# Lists of maps (common pattern)
+users:
+  - name: Alice
+    role: admin
+    email: alice@example.com
+    permissions:
+      - read
+      - write
+      - delete
+  
+  - name: Bob
+    role: user
+    email: bob@example.com
+    permissions:
+      - read
+  
+  - name: Charlie
+    role: moderator
+    email: charlie@example.com
+    permissions:
+      - read
+      - write
+
+# Comments are ignored
+# This entire line is a comment
+key: value  # This is an inline comment

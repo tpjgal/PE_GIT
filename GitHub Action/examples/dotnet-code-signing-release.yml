@@ -1,0 +1,341 @@
+name: C# Code Signing & Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: 'Release type'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - alpha
+          - beta
+          - release
+
+env:
+  DOTNET_VERSION: '8.0.x'
+  SOLUTION_FILE: 'YourSolution.sln'
+  PROJECT_FILE: 'src/YourProject.csproj'
+  CONFIGURATION: 'Release'
+
+jobs:
+  # Stage 1: Build Release Version
+  build-release:
+    name: Build Release
+    runs-on: windows-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+      
+      - name: Determine version
+        id: version
+        shell: pwsh
+        run: |
+          if ("${{ github.event.release.tag_name }}" -ne "") {
+            $version = "${{ github.event.release.tag_name }}".TrimStart('v')
+          } else {
+            $version = (Get-Date -Format "1.0.yy.MMdd")
+          }
+          Write-Host "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "Version: $version"
+      
+      - name: Restore dependencies
+        run: dotnet restore ${{ env.SOLUTION_FILE }}
+      
+      - name: Build Release
+        run: dotnet build ${{ env.SOLUTION_FILE }} `
+          --configuration ${{ env.CONFIGURATION }} `
+          --no-restore `
+          -p:Version=${{ steps.version.outputs.version }} `
+          -p:Deterministic=true `
+          -p:ContinuousIntegrationBuild=true
+      
+      - name: Publish binaries
+        run: dotnet publish ${{ env.PROJECT_FILE }} `
+          --configuration ${{ env.CONFIGURATION }} `
+          --output "publish" `
+          --no-restore `
+          --no-build `
+          -p:PublishReadyToRun=true
+      
+      - name: Archive build output
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-binaries
+          path: publish/
+          retention-days: 7
+
+  # Stage 2: Sign Code & Create Packages
+  sign-and-package:
+    name: Sign & Package
+    runs-on: windows-latest
+    needs: build-release
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+      
+      - name: Download release binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: release-binaries
+          path: publish/
+      
+      - name: Import code signing certificate
+        env:
+          SIGNING_CERT_BASE64: ${{ secrets.SIGNING_CERTIFICATE_BASE64 }}
+          SIGNING_CERT_PASSWORD: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
+        shell: pwsh
+        run: |
+          if ("${{ env.SIGNING_CERT_BASE64 }}" -eq "") {
+            Write-Host "⚠️ Skipping code signing: Certificate not configured"
+            exit 0
+          }
+          
+          # Decode and import certificate
+          $certBytes = [Convert]::FromBase64String("${{ env.SIGNING_CERT_BASE64 }}")
+          $certPath = "signing-cert.pfx"
+          [IO.File]::WriteAllBytes($certPath, $certBytes)
+          
+          # Import to Personal certificate store
+          $cert = Import-PfxCertificate -FilePath $certPath `
+            -CertStoreLocation "Cert:\CurrentUser\My" `
+            -Password (ConvertTo-SecureString -String "${{ env.SIGNING_CERT_PASSWORD }}" -AsPlainText -Force) `
+            -WarningAction SilentlyContinue
+          
+          Write-Host "✓ Certificate imported: $($cert.Thumbprint)"
+          
+          # Cleanup sensitive file
+          Remove-Item -Path $certPath -Force
+          exit 0
+      
+      - name: Sign assemblies
+        env:
+          SIGNING_CERT_PASSWORD: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
+        shell: pwsh
+        run: |
+          # Find signing certificate
+          $cert = Get-ChildItem "Cert:\CurrentUser\My" -CodeSigningCert | Select-Object -First 1
+          
+          if ($null -eq $cert) {
+            Write-Host "⚠️ No code signing certificate found. Skipping assembly signing."
+            exit 0
+          }
+          
+          # Sign DLL and EXE files
+          $filesToSign = Get-ChildItem -Path "publish/" -Include "*.dll", "*.exe" -Recurse
+          
+          foreach ($file in $filesToSign) {
+            Write-Host "Signing: $($file.Name)"
+            Set-AuthenticodeSignature -FilePath $file.FullName `
+              -Certificate $cert `
+              -TimestampServer "http://timestamp.digicert.com" `
+              -IncludeChain All `
+              -HashAlgorithm SHA256 | Out-Null
+          }
+          
+          Write-Host "✓ Signed $($filesToSign.Count) files"
+      
+      - name: Verify signatures
+        shell: pwsh
+        run: |
+          $signedFiles = Get-ChildItem -Path "publish/" -Include "*.dll", "*.exe" -Recurse
+          
+          if ($signedFiles.Count -eq 0) {
+            Write-Host "No signed files to verify"
+            exit 0
+          }
+          
+          Write-Host "Verifying signatures..."
+          $verified = 0
+          
+          foreach ($file in $signedFiles) {
+            $signature = Get-AuthenticodeSignature -FilePath $file.FullName
+            
+            if ($signature.Status -eq "Valid") {
+              $verified++
+              Write-Host "✓ $($file.Name)"
+            } else {
+              Write-Host "✗ $($file.Name) - Invalid signature"
+            }
+          }
+          
+          Write-Host "Verified: $verified/$($signedFiles.Count)"
+          
+          if ($verified -ne $signedFiles.Count) {
+            exit 1
+          }
+      
+      - name: Create packages
+        shell: pwsh
+        run: |
+          $publishPath = "publish"
+          $version = "${{ needs.build-release.outputs.version }}"
+          
+          # Create package directory structure
+          New-Item -ItemType Directory -Path "packages/bin" -Force | Out-Null
+          New-Item -ItemType Directory -Path "packages/docs" -Force | Out-Null
+          
+          Copy-Item -Path "$publishPath/*" -Destination "packages/bin/" -Recurse -Force
+          
+          # Create ZIP package
+          $zipName = "YourProject-$version-release.zip"
+          Compress-Archive -Path "packages/*" -DestinationPath $zipName -Force
+          Write-Host "Created: $zipName"
+          
+          # Create NuGet package
+          dotnet pack ${{ env.PROJECT_FILE }} `
+            --configuration ${{ env.CONFIGURATION }} `
+            --output "packages/nuget" `
+            -p:Version=$version `
+            -p:IncludeSymbols=true `
+            -p:SymbolPackageFormat=snupkg
+      
+      - name: Generate checksums
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem -Path "packages" -Recurse -File
+          
+          $checksums = @()
+          foreach ($file in $files) {
+            $hash = (Get-FileHash -Path $file.FullName -Algorithm SHA256).Hash
+            $checksums += "$hash  $($file.Name)"
+          }
+          
+          $checksums | Out-File -FilePath "CHECKSUMS.txt" -Encoding UTF8
+          Write-Host "Generated CHECKSUMS.txt"
+      
+      - name: Archive packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-packages
+          path: |
+            packages/
+            CHECKSUMS.txt
+            *.zip
+          retention-days: 90
+
+  # Stage 3: Publish Release
+  publish-release:
+    name: Publish Release
+    runs-on: ubuntu-latest
+    needs: [ build-release, sign-and-package ]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+      
+      - name: Download signed packages
+        uses: actions/download-artifact@v4
+        with:
+          name: signed-packages
+          path: release-files/
+      
+      - name: Prepare release notes
+        id: release_notes
+        shell: bash
+        run: |
+          VERSION="${{ needs.build-release.outputs.version }}"
+          RELEASE_TYPE="${{ github.event.inputs.release_type || 'release' }}"
+          
+          cat > RELEASE_NOTES.md << EOF
+          # Release v${VERSION}
+          
+          **Release Type**: ${RELEASE_TYPE}
+          **Build Number**: ${{ github.run_number }}
+          **Commit**: ${{ github.sha }}
+          **Branch**: ${{ github.ref }}
+          
+          ## Artifacts
+          
+          - **Binaries**: YourProject-${VERSION}-release.zip
+          - **Documentation**: See docs/ folder
+          - **Checksums**: See CHECKSUMS.txt
+          
+          ## Installation
+          
+          1. Download the ZIP file
+          2. Extract to desired location
+          3. Run YourProject.exe
+          
+          ## Breaking Changes
+          
+          None
+          
+          ## Bug Fixes
+          
+          - See commit history: https://github.com/${{ github.repository }}/commits/${{ github.sha }}
+          
+          ## Security
+          
+          - All binaries are digitally signed
+          - Verify signatures: \`Get-AuthenticodeSignature -FilePath YourProject.exe\`
+          EOF
+          
+          cat RELEASE_NOTES.md >> $GITHUB_STEP_SUMMARY
+      
+      - name: Publish NuGet packages
+        if: github.event.release.prerelease == false
+        run: |
+          NUGET_PACKAGES=$(find release-files -name "*.nupkg" ! -name "*.snupkg")
+          
+          if [ -z "$NUGET_PACKAGES" ]; then
+            echo "No NuGet packages found"
+            exit 0
+          fi
+          
+          for pkg in $NUGET_PACKAGES; do
+            dotnet nuget push "$pkg" \
+              --api-key ${{ secrets.NUGET_API_KEY }} \
+              --source https://api.nuget.org/v3/index.json \
+              --skip-duplicate || true
+          done
+        continue-on-error: true
+      
+      - name: Upload to GitHub Release
+        if: github.event.release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            release-files/**/*.zip
+            release-files/CHECKSUMS.txt
+            RELEASE_NOTES.md
+          body_path: RELEASE_NOTES.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Post release notification
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const version = "${{ needs.build-release.outputs.version }}";
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number || context.payload.release.id,
+              body: `✅ Release \`v${version}\` published successfully!`
+            });
+        continue-on-error: true

@@ -1,0 +1,193 @@
+# YAML Example: Real-World Configuration Files
+
+# ============================================
+# Docker Compose Configuration
+# ============================================
+---
+version: '3.8'
+
+services:
+  # PostgreSQL Database Service
+  database:
+    image: postgres:14-alpine
+    container_name: my_database
+    environment:
+      POSTGRES_USER: myuser
+      POSTGRES_PASSWORD: mypassword
+      POSTGRES_DB: myapp_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U myuser"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Web Application Service
+  web:
+    image: my-app:latest
+    container_name: my_web_app
+    depends_on:
+      database:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "postgresql://myuser:mypassword@database:5432/myapp_db"
+      ENVIRONMENT: production
+      DEBUG: "false"
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./app:/app
+    restart: unless-stopped
+
+  # Redis Cache Service
+  cache:
+    image: redis:7-alpine
+    container_name: my_cache
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  default:
+    name: my-network
+
+# ============================================
+# Application Configuration
+# ============================================
+---
+app:
+  name: My Application
+  version: 1.0.0
+  description: Production application configuration
+
+server:
+  host: 0.0.0.0
+  port: 8000
+  workers: 4
+  timeout: 30
+
+database:
+  type: postgresql
+  host: localhost
+  port: 5432
+  name: myapp_db
+  connection_pool:
+    min_size: 5
+    max_size: 20
+
+authentication:
+  jwt_secret: your-secret-key-here
+  token_expiry: 3600
+  refresh_token_expiry: 86400
+
+logging:
+  level: info
+  format: json
+  outputs:
+    - file: /var/log/app.log
+      rotation: daily
+      retention: 30
+    - console:
+        enabled: true
+
+cache:
+  backend: redis
+  host: localhost
+  port: 6379
+  ttl: 3600
+
+features:
+  user_registration: true
+  two_factor_auth: false
+  email_notifications: true
+  api_rate_limiting: true
+  rate_limit:
+    requests: 100
+    window: 60  # seconds
+
+# ============================================
+# Kubernetes-like Pod Configuration
+# ============================================
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: my-app-pod
+  namespace: production
+  labels:
+    app: my-app
+    version: v1
+  annotations:
+    description: "Production application pod"
+
+spec:
+  replicas: 3
+  containers:
+    - name: app
+      image: my-app:1.0.0
+      imagePullPolicy: IfNotPresent
+      ports:
+        - containerPort: 8000
+          name: http
+          protocol: TCP
+      
+      env:
+        - name: ENVIRONMENT
+          value: production
+        - name: LOG_LEVEL
+          value: info
+        - name: DATABASE_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: config
+              key: db.host
+      
+      resources:
+        requests:
+          memory: "256Mi"
+          cpu: "250m"
+        limits:
+          memory: "512Mi"
+          cpu: "500m"
+      
+      livenessProbe:
+        httpGet:
+          path: /health
+          port: 8000
+        initialDelaySeconds: 30
+        periodSeconds: 10
+      
+      readinessProbe:
+        httpGet:
+          path: /ready
+          port: 8000
+        initialDelaySeconds: 5
+        periodSeconds: 5
+      
+      volumeMounts:
+        - name: config
+          mountPath: /etc/config
+        - name: logs
+          mountPath: /var/log
+  
+  volumes:
+    - name: config
+      configMap:
+        name: app-config
+    - name: logs
+      emptyDir: {}
+  
+  imagePullSecrets:
+    - name: registry-credentials
+  
+  restartPolicy: Always
+  terminationGracePeriodSeconds: 30

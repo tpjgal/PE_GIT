@@ -1,0 +1,385 @@
+name: VC++ Deployment Pipeline
+
+# Trigger on releases or builds to main branch
+on:
+  release:
+    types: [published]
+  workflow_run:
+    workflows: ["VC++ CI/CD Pipeline"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      deployment_target:
+        description: 'Deployment target environment'
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+      version:
+        description: 'Version to deploy (leave blank for latest)'
+        required: false
+
+env:
+  ARTIFACTS_DIR: '${{ github.workspace }}\artifacts'
+  DEPLOY_SCRIPTS_DIR: 'scripts/deploy'
+
+permissions:
+  repository-projects: read
+  packages: read
+  contents: read
+
+jobs:
+  # Download and validate artifacts
+  prepare-deployment:
+    name: Prepare Deployment Package
+    runs-on: windows-latest
+    
+    outputs:
+      package_version: ${{ steps.package.outputs.version }}
+      package_path: ${{ steps.package.outputs.path }}
+      checksums: ${{ steps.package.outputs.checksums }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Download latest release
+        if: github.event_name == 'release'
+        run: |
+          # Download packages from release
+          $releaseTag = "${{ github.event.release.tag_name }}"
+          $downloadDir = "${{ env.ARTIFACTS_DIR }}\download"
+          New-Item -ItemType Directory -Path $downloadDir -Force
+          
+          Write-Host "Preparing to download release: $releaseTag"
+      
+      - name: Validate package integrity
+        id: package
+        run: |
+          $packageDir = "${{ env.ARTIFACTS_DIR }}\download"
+          
+          # Validate checksums
+          if (Test-Path "$packageDir\CHECKSUMS.txt") {
+            Write-Host "Validating package checksums..."
+            
+            $checksums = Get-Content "$packageDir\CHECKSUMS.txt"
+            $valid = $true
+            
+            foreach ($line in $checksums) {
+              if ($line -match '^([A-Fa-f0-9]+)\s+(.+)$') {
+                $expectedHash = $Matches[1]
+                $fileName = $Matches[2]
+                $filePath = Join-Path $packageDir $fileName
+                
+                if (Test-Path $filePath) {
+                  $actualHash = (Get-FileHash $filePath -Algorithm SHA256).Hash
+                  if ($actualHash -eq $expectedHash) {
+                    Write-Host "✓ $fileName verified"
+                  } else {
+                    Write-Host "✗ $fileName checksum mismatch!"
+                    $valid = $false
+                  }
+                }
+              }
+            }
+            
+            if (-not $valid) {
+              throw "Checksum validation failed"
+            }
+          }
+          
+          $version = if ($env:INPUT_VERSION) { $env:INPUT_VERSION } else { "1.0.0.${{ github.run_number }}" }
+          echo "version=$version" >> $env:GITHUB_OUTPUT
+          echo "path=$packageDir" >> $env:GITHUB_OUTPUT
+          echo "checksums=$checksums" >> $env:GITHUB_OUTPUT
+      
+      - name: Display package contents
+        run: |
+          Write-Host "Package Contents:"
+          Get-ChildItem -Path "${{ steps.package.outputs.path }}" -Recurse | ForEach-Object {
+            $size = if ($_.PSIsContainer) { "-" } else { "$([Math]::Round($_.Length / 1KB, 2)) KB" }
+            Write-Host "  $($_.FullName | Resolve-Path -Relative) ($size)"
+          }
+
+  # Pre-deployment validation
+  validate-deployment:
+    name: Validate Deployment Environment (${{ matrix.environment }})
+    runs-on: windows-latest
+    needs: prepare-deployment
+    
+    strategy:
+      matrix:
+        environment: [staging]
+    
+    environment:
+      name: ${{ matrix.environment }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Check deployment prerequisites
+        run: |
+          Write-Host "Validating deployment prerequisites for ${{ matrix.environment }}..."
+          
+          # Check if all required tools are available
+          $requiredTools = @(
+            "Powershell",
+            "Git"
+          )
+          
+          foreach ($tool in $requiredTools) {
+            if (Get-Command $tool -ErrorAction SilentlyContinue) {
+              Write-Host "✓ $tool found"
+            } else {
+              throw "$tool not found"
+            }
+          }
+      
+      - name: Test deployment credentials
+        run: |
+          # Validate that deployment secrets are configured
+          if ("${{ secrets.DEPLOYMENT_SERVER_HOST }}" -eq "") {
+            throw "DEPLOYMENT_SERVER_HOST secret not configured"
+          }
+          
+          Write-Host "✓ Deployment credentials configured"
+      
+      - name: Verify target environment
+        run: |
+          # Health check of deployment target
+          Write-Host "Checking target environment health..."
+          
+          # Example: ping target server
+          $targetHost = "${{ secrets.DEPLOYMENT_SERVER_HOST }}"
+          if (Test-Connection -ComputerName $targetHost -Count 1 -ErrorAction SilentlyContinue) {
+            Write-Host "✓ Target environment is reachable"
+          } else {
+            Write-Host "⚠ Warning: Could not reach target environment"
+          }
+
+  # Deploy to staging
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: windows-latest
+    needs: [prepare-deployment, validate-deployment]
+    if: github.event.release || github.event_name == 'workflow_dispatch'
+    
+    environment:
+      name: staging
+      url: https://staging.example.com
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Download deployment package
+        uses: actions/download-artifact@v3
+        with:
+          name: release-packages
+          path: ${{ env.ARTIFACTS_DIR }}
+      
+      - name: Prepare deployment scripts
+        run: |
+          # Copy deployment scripts
+          Copy-Item "${{ env.DEPLOY_SCRIPTS_DIR }}\*" -Destination "${{ env.ARTIFACTS_DIR }}" -Recurse -Force
+          
+          # Make scripts executable
+          Get-ChildItem -Path "${{ env.ARTIFACTS_DIR }}" -Filter "*.ps1" | ForEach-Object {
+            Write-Host "Prepared: $($_.Name)"
+          }
+      
+      - name: Execute pre-deployment checks
+        run: |
+          & "${{ env.ARTIFACTS_DIR }}\pre-deployment-checks.ps1" `
+            -Environment "staging" `
+            -Version "${{ needs.prepare-deployment.outputs.package_version }}"
+      
+      - name: Stop current deployment (if exists)
+        continue-on-error: true
+        run: |
+          Write-Host "Stopping current application instances..."
+          Get-Process -Name "MyProject" -ErrorAction SilentlyContinue | Stop-Process -Force
+          Start-Sleep -Seconds 2
+      
+      - name: Backup current version
+        run: |
+          $backupDir = "${{ env.ARTIFACTS_DIR }}\backup\$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+          $deployDir = "C:\DeploymentRoot\staging"
+          
+          if (Test-Path $deployDir) {
+            New-Item -ItemType Directory -Path $backupDir -Force
+            Copy-Item "$deployDir\*" -Destination $backupDir -Recurse -Force
+            Write-Host "Backup created at: $backupDir"
+          }
+      
+      - name: Deploy new version
+        run: |
+          $deployDir = "C:\DeploymentRoot\staging"
+          $packageDir = "${{ env.ARTIFACTS_DIR }}\MyProject-v${{ needs.prepare-deployment.outputs.package_version }}"
+          
+          # Create deployment directory if not exists
+          New-Item -ItemType Directory -Path $deployDir -Force
+          
+          # Copy new version
+          Copy-Item "$packageDir\*" -Destination $deployDir -Recurse -Force
+          
+          Write-Host "✓ Deployment complete to $deployDir"
+      
+      - name: Start application
+        run: |
+          $executablePath = "C:\DeploymentRoot\staging\bin\MyProject.exe"
+          
+          if (Test-Path $executablePath) {
+            & $executablePath --no-ui --config-file "C:\DeploymentRoot\staging\config.ini"
+            Write-Host "✓ Application started"
+            Start-Sleep -Seconds 3
+          } else {
+            throw "Executable not found: $executablePath"
+          }
+      
+      - name: Post-deployment health check
+        run: |
+          $maxRetries = 10
+          $retryCount = 0
+          
+          while ($retryCount -lt $maxRetries) {
+            try {
+              $response = Invoke-WebRequest -Uri "http://localhost:8080/health" -ErrorAction Stop
+              if ($response.StatusCode -eq 200) {
+                Write-Host "✓ Application is healthy"
+                break
+              }
+            } catch {
+              $retryCount++
+              if ($retryCount -lt $maxRetries) {
+                Write-Host "Health check failed, retrying... ($retryCount/$maxRetries)"
+                Start-Sleep -Seconds 2
+              } else {
+                throw "Health check failed after $maxRetries attempts"
+              }
+            }
+          }
+      
+      - name: Run smoke tests
+        run: |
+          Write-Host "Running smoke tests in staging..."
+          
+          # Example smoke test
+          $testUrl = "http://localhost:8080/api/version"
+          try {
+            $response = Invoke-RestMethod -Uri $testUrl -ErrorAction Stop
+            Write-Host "✓ API responding: $($response.version)"
+          } catch {
+            throw "Smoke test failed: $_"
+          }
+      
+      - name: Create deployment report
+        if: always()
+        run: |
+          $report = @{
+            timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC'
+            environment = "staging"
+            version = "${{ needs.prepare-deployment.outputs.package_version }}"
+            status = $?
+            commit = "${{ github.sha }}"
+            actor = "${{ github.actor }}"
+          }
+          
+          $report | ConvertTo-Json | Out-File -Path "${{ env.ARTIFACTS_DIR }}\deployment-report.json"
+      
+      - name: Upload deployment report
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: deployment-report-staging
+          path: ${{ env.ARTIFACTS_DIR }}/deployment-report.json
+
+  # Deploy to production (requires approval)
+  deploy-production:
+    name: Deploy to Production
+    runs-on: windows-latest
+    needs: [prepare-deployment, deploy-staging]
+    if: github.event.release && github.event.action == 'published'
+    
+    environment:
+      name: production
+      url: https://example.com
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Notify deployment start
+        run: |
+          Write-Host "═══════════════════════════════════════════════"
+          Write-Host "PRODUCTION DEPLOYMENT INITIATED"
+          Write-Host "═══════════════════════════════════════════════"
+          Write-Host "Version: ${{ needs.prepare-deployment.outputs.package_version }}"
+          Write-Host "Initiated by: ${{ github.actor }}"
+          Write-Host "Time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')"
+      
+      - name: Download deployment package
+        uses: actions/download-artifact@v3
+        with:
+          name: release-packages
+          path: ${{ env.ARTIFACTS_DIR }}
+      
+      - name: Execute production deployment
+        run: |
+          Write-Host "Executing production deployment script..."
+          
+          $deployDir = "C:\DeploymentRoot\production"
+          $packageDir = "${{ env.ARTIFACTS_DIR }}\MyProject-v${{ needs.prepare-deployment.outputs.package_version }}"
+          
+          # Backup current version
+          $backupDir = "$deployDir\backups\$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+          New-Item -ItemType Directory -Path $backupDir -Force
+          Copy-Item "$deployDir\*" -Destination $backupDir -Recurse -Force
+          
+          # Deploy new version
+          Copy-Item "$packageDir\*" -Destination $deployDir -Recurse -Force
+          
+          Write-Host "✓ Production deployment complete"
+      
+      - name: Verify production deployment
+        run: |
+          Write-Host "Verifying production environment..."
+          
+          $maxRetries = 20
+          $retryCount = 0
+          
+          while ($retryCount -lt $maxRetries) {
+            try {
+              $response = Invoke-WebRequest -Uri "https://example.com/health" -ErrorAction Stop
+              Write-Host "✓ Production environment is healthy"
+              break
+            } catch {
+              $retryCount++
+              if ($retryCount -lt $maxRetries) {
+                Start-Sleep -Seconds 5
+              } else {
+                throw "Production verification failed"
+              }
+            }
+          }
+      
+      - name: Create production deployment notification
+        if: success()
+        run: |
+          $message = @"
+          ✅ Production Deployment Successful
+          
+          Version: ${{ needs.prepare-deployment.outputs.package_version }}
+          Environment: production
+          Timestamp: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')
+          Deployed by: ${{ github.actor }}
+          
+          Release: https://github.com/${{ github.repository }}/releases/tag/${{ github.event.release.tag_name }}
+          "@
+          
+          Write-Host $message
+          
+          # TODO: Send notifications to Slack, Teams, email, etc.
